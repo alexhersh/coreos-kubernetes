@@ -5,7 +5,7 @@ set -e
 export ETCD_ENDPOINTS=
 
 # Specify the version (vX.Y.Z) of Kubernetes assets to deploy
-export K8S_VER=v1.0.6
+export K8S_VER=v1.1.0-alpha.1
 
 # The CIDR network to use for pod IPs.
 # Each pod launched in the cluster will be assigned an IP out of this range.
@@ -74,6 +74,59 @@ function init_flannel {
     fi
 }
 
+function init_calico {
+
+    local TEMPLATE=/etc/systemd/system/calico-download.service
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Unit]
+Description=Download calicoctl
+Documentation=https://github.com/projectcalico/calico-docker
+Requires=kubelet.service
+After=kubelet.service
+
+[Service]
+User=root
+PermissionsStartOnly=true
+ExecStartPre=/usr/bin/mkdir -p /etc/calico/
+ExecStart=/usr/bin/wget https://github.com/projectcalico/calico-docker/releases/download/v0.9.0/calicoctl -O /etc/calico/calicoctl
+ExecStart=/usr/bin/chmod +x /etc/calico/calicoctl
+RemainAfterExit=yes
+Type=oneshot
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    }
+
+    local TEMPLATE=/etc/systemd/system/calico-node.service
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Unit]
+Description=Calico per-node agent
+Documentation=https://github.com/projectcalico/calico-docker
+Requires=calico-download.service
+After=calico-download.service
+
+[Service]
+Environment="ETCD_AUTHORITY=127.0.0.1:6666"
+User=root
+PermissionsStartOnly=true
+ExecStart=/etc/calico/calicoctl node --detach=false
+ExecStart=/etc/calico/calicoctl pool add ${POD_NETWORK}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    }
+}
+
 function init_templates {
     local TEMPLATE=/etc/systemd/system/kubelet.service
     [ -f $TEMPLATE ] || {
@@ -98,6 +151,59 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
     }
+
+    local TEMPLATE=/etc/kubernetes/manifests/calico-etcd.yaml
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+apiVersion: v1
+kind: Pod
+metadata:
+  name: calico-etcd
+  namespace: kube-system
+spec:
+  containers:
+    -
+      name: calico-etcd-container
+      image: gcr.io/google_containers/etcd:2.0.12
+      resources:
+        limits:
+          cpu: 100m
+      command:
+        - /usr/local/bin/etcd
+        - --name
+        - calico-etcd
+        - --data-dir
+        - /var/etcd/calico-data
+        - --advertise-client-urls
+        - http://${ADVERTISE_IP}:6666
+        - --listen-client-urls
+        - http://0.0.0.0:6666
+        - --listen-peer-urls
+        - http://0.0.0.0:6660
+        - --initial-advertise-peer-urls
+        - http://${ADVERTISE_IP}:6660
+        - --initial-cluster
+        - calico-etcd=http://${ADVERTISE_IP}:6660
+      ports:
+        -
+          name: clientport
+          containerPort: 6666
+          hostPort: 6666
+      volumeMounts:
+        -
+          name: varetcd
+          mountPath: /var/etcd
+          readOnly: false
+  volumes:
+    -
+      name: varetcd
+      hostPath:
+        path: /mnt/master-pd/var/etcd
+EOF
+    }
+
 
     local TEMPLATE=/etc/kubernetes/manifests/kube-proxy.yaml
     [ -f $TEMPLATE ] || {
@@ -519,36 +625,36 @@ EOF
 EOF
     }
 
-    local TEMPLATE=/etc/flannel/options.env
-    [ -f $TEMPLATE ] || {
-        echo "TEMPLATE: $TEMPLATE"
-        mkdir -p $(dirname $TEMPLATE)
-        cat << EOF > $TEMPLATE
-FLANNELD_IFACE=$ADVERTISE_IP
-FLANNELD_ETCD_ENDPOINTS=$ETCD_ENDPOINTS
-EOF
-    }
+#     local TEMPLATE=/etc/flannel/options.env
+#     [ -f $TEMPLATE ] || {
+#         echo "TEMPLATE: $TEMPLATE"
+#         mkdir -p $(dirname $TEMPLATE)
+#         cat << EOF > $TEMPLATE
+# FLANNELD_IFACE=$ADVERTISE_IP
+# FLANNELD_ETCD_ENDPOINTS=$ETCD_ENDPOINTS
+# EOF
+#     }
 
-    local TEMPLATE=/etc/systemd/system/flanneld.service.d/40-ExecStartPre-symlink.conf.conf
-    [ -f $TEMPLATE ] || {
-        echo "TEMPLATE: $TEMPLATE"
-        mkdir -p $(dirname $TEMPLATE)
-        cat << EOF > $TEMPLATE
-[Service]
-ExecStartPre=/usr/bin/ln -sf /etc/flannel/options.env /run/flannel/options.env
-EOF
-    }
+#     local TEMPLATE=/etc/systemd/system/flanneld.service.d/40-ExecStartPre-symlink.conf.conf
+#     [ -f $TEMPLATE ] || {
+#         echo "TEMPLATE: $TEMPLATE"
+#         mkdir -p $(dirname $TEMPLATE)
+#         cat << EOF > $TEMPLATE
+# [Service]
+# ExecStartPre=/usr/bin/ln -sf /etc/flannel/options.env /run/flannel/options.env
+# EOF
+#     }
 
-    local TEMPLATE=/etc/systemd/system/docker.service.d/40-flannel.conf
-    [ -f $TEMPLATE ] || {
-        echo "TEMPLATE: $TEMPLATE"
-        mkdir -p $(dirname $TEMPLATE)
-        cat << EOF > $TEMPLATE
-[Unit]
-Requires=flanneld.service
-After=flanneld.service
-EOF
-    }
+#     local TEMPLATE=/etc/systemd/system/docker.service.d/40-flannel.conf
+#     [ -f $TEMPLATE ] || {
+#         echo "TEMPLATE: $TEMPLATE"
+#         mkdir -p $(dirname $TEMPLATE)
+#         cat << EOF > $TEMPLATE
+# [Unit]
+# Requires=flanneld.service
+# After=flanneld.service
+# EOF
+#     }
 
 }
 
@@ -568,8 +674,9 @@ function start_addons {
 
 init_config
 init_templates
+init_calico
 
-init_flannel
+# init_flannel
 
 systemctl stop update-engine; systemctl mask update-engine
 

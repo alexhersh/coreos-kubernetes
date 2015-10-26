@@ -10,7 +10,7 @@ export ETCD_ENDPOINTS=
 export CONTROLLER_ENDPOINT=
 
 # Specify the version (vX.Y.Z) of Kubernetes assets to deploy
-export K8S_VER=v1.0.6
+export K8S_VER=v1.1.0-alpha.1
 
 # The IP address of the cluster DNS service.
 # This must be the same DNS_SERVICE_IP used when configuring the controller nodes.
@@ -40,13 +40,86 @@ function init_config {
     done
 }
 
+function init_calico {
+    local TEMPLATE=/etc/network-environment
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+#! /usr/bin/bash
+# This node's IPv4 address
+DEFAULT_IPV4=${ADVERTISE_IP}
+# The Kubernetes master IP
+KUBERNETES_MASTER=172.17.4.101
+# IP and port of etcd instance used by Calico
+ETCD_AUTHORITY=172.17.4.101:6666
+# URL to access the Kubernetes apiserver
+KUBE_API_ROOT=https://172.17.4.101:443/api/v1/
+# Enable Calcio IPAM
+CALICO_IPAM=true
+TOKEN=<TOKEN>
+EOF
+    }
+
+    local TEMPLATE=/etc/systemd/system/calico-download.service
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Unit]
+Description=Download calicoctl
+Documentation=https://github.com/projectcalico/calico-docker
+
+[Service]
+User=root
+PermissionsStartOnly=true
+ExecStartPre=/usr/bin/mkdir -p /etc/calico/
+ExecStart=/usr/bin/wget https://github.com/projectcalico/calico-docker/releases/download/v0.9.0/calicoctl -O /etc/calico/calicoctl
+ExecStart=/usr/bin/chmod +x /etc/calico/calicoctl
+RemainAfterExit=yes
+Type=oneshot
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    }
+
+    local TEMPLATE=/etc/systemd/system/calico-node.service
+    [ -f $TEMPLATE ] || {
+        echo "TEMPLATE: $TEMPLATE"
+        mkdir -p $(dirname $TEMPLATE)
+        cat << EOF > $TEMPLATE
+[Unit]
+Description=Calico per-node agent
+Documentation=https://github.com/projectcalico/calico-docker
+Requires=calico-download.service
+After=calico-download.service
+
+[Service]
+EnvironmentFile=/etc/network-environment
+User=root
+PermissionsStartOnly=true
+ExecStart=/etc/calico/calicoctl node --ip=${DEFAULT_IPV4} --kubernetes --kube-plugin-version=v0.4.0 --detach=false
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    }
+}
+
 function init_templates {
     local TEMPLATE=/etc/systemd/system/kubelet.service
     [ -f $TEMPLATE ] || {
         echo "TEMPLATE: $TEMPLATE"
         mkdir -p $(dirname $TEMPLATE)
         cat << EOF > $TEMPLATE
+[Unit]
+Requires=calico-node.service
+After=calico-node.service
 [Service]
+EnvironmentFile=/etc/network-environment
 ExecStartPre=/usr/bin/mkdir -p /etc/kubernetes/manifests
 ExecStart=/usr/bin/kubelet \
   --api_servers=${CONTROLLER_ENDPOINT} \
@@ -56,6 +129,8 @@ ExecStart=/usr/bin/kubelet \
   --hostname-override=${ADVERTISE_IP} \
   --cluster_dns=${DNS_SERVICE_IP} \
   --cluster_domain=cluster.local \
+  --network_plugin=calico \
+  --network_plugin_dir=/etc/kubernetes/kubelet-plugins/net/exec/ \
   --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml \
   --tls-cert-file=/etc/kubernetes/ssl/worker.pem \
   --tls-private-key-file=/etc/kubernetes/ssl/worker-key.pem \
@@ -112,6 +187,7 @@ spec:
     - proxy
     - --master=${CONTROLLER_ENDPOINT}
     - --kubeconfig=/etc/kubernetes/worker-kubeconfig.yaml
+    - --legacy-userspace-proxy=false
     securityContext:
       privileged: true
     volumeMounts:
@@ -136,40 +212,41 @@ spec:
 EOF
     }
 
-    local TEMPLATE=/etc/flannel/options.env
-    [ -f $TEMPLATE ] || {
-        echo "TEMPLATE: $TEMPLATE"
-        mkdir -p $(dirname $TEMPLATE)
-        cat << EOF > $TEMPLATE
-FLANNELD_IFACE=$ADVERTISE_IP
-FLANNELD_ETCD_ENDPOINTS=$ETCD_ENDPOINTS
-EOF
-    }
+#     local TEMPLATE=/etc/flannel/options.env
+#     [ -f $TEMPLATE ] || {
+#         echo "TEMPLATE: $TEMPLATE"
+#         mkdir -p $(dirname $TEMPLATE)
+#         cat << EOF > $TEMPLATE
+# FLANNELD_IFACE=$ADVERTISE_IP
+# FLANNELD_ETCD_ENDPOINTS=$ETCD_ENDPOINTS
+# EOF
+#     }
 
-    local TEMPLATE=/etc/systemd/system/flanneld.service.d/40-ExecStartPre-symlink.conf.conf
-    [ -f $TEMPLATE ] || {
-        echo "TEMPLATE: $TEMPLATE"
-        mkdir -p $(dirname $TEMPLATE)
-        cat << EOF > $TEMPLATE
-[Service]
-ExecStartPre=/usr/bin/ln -sf /etc/flannel/options.env /run/flannel/options.env
-EOF
-    }
+#     local TEMPLATE=/etc/systemd/system/flanneld.service.d/40-ExecStartPre-symlink.conf.conf
+#     [ -f $TEMPLATE ] || {
+#         echo "TEMPLATE: $TEMPLATE"
+#         mkdir -p $(dirname $TEMPLATE)
+#         cat << EOF > $TEMPLATE
+# [Service]
+# ExecStartPre=/usr/bin/ln -sf /etc/flannel/options.env /run/flannel/options.env
+# EOF
+#     }
 
-    local TEMPLATE=/etc/systemd/system/docker.service.d/40-flannel.conf
-    [ -f $TEMPLATE ] || {
-        echo "TEMPLATE: $TEMPLATE"
-        mkdir -p $(dirname $TEMPLATE)
-        cat << EOF > $TEMPLATE
-[Unit]
-Requires=flanneld.service
-After=flanneld.service
-EOF
-    }
+#     local TEMPLATE=/etc/systemd/system/docker.service.d/40-flannel.conf
+#     [ -f $TEMPLATE ] || {
+#         echo "TEMPLATE: $TEMPLATE"
+#         mkdir -p $(dirname $TEMPLATE)
+#         cat << EOF > $TEMPLATE
+# [Unit]
+# Requires=flanneld.service
+# After=flanneld.service
+# EOF
+#     }
 
 }
 
 init_config
+init_calico
 init_templates
 
 systemctl stop update-engine; systemctl mask update-engine
